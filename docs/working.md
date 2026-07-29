@@ -4,6 +4,22 @@
 
 ### 2026-07-29 (continued)
 
+- SmartThings API 验证成功：开关电视、查状态都通过 `curl` 测试通过
+- 改为 WiFi + SmartThings API 方案，不再用红外
+- 固件：连 WiFi → 菜单选 Power/Vol+/Vol-/Mute/Source/CH+ → 发 SmartThings API HTTP 请求
+- Power 和 Mute 是 toggle：先查当前状态再发反向命令
+- secrets.h 存 WiFi SSID/password + SmartThings token + device ID，gitignored
+- 编译通过 36% Flash（WiFi+HTTPS 库较大）
+
+## Lessons Learned (continued)
+
+- SmartThings PAT 24 小时过期（2024-12-30 后创建的）。长期方案需要 OAuth2 app。
+- SmartThings API 命令格式：POST `https://api.smartthings.com/v1/devices/{deviceId}/commands`，body 是 `{"commands":[{"component":"main","capability":"switch","command":"on"}]}`
+- 查状态：GET `https://api.smartthings.com/v1/devices/{deviceId}/components/main/status`
+- 返回 `COMPLETED` = 同步完成，`ACCEPTED` = 异步已接受（大命令如开机可能先 ACCEPTED）
+- ESP32 WiFiClientSecure + `setInsecure()` 跳过证书验证，HTTPS 能正常工作
+- Wake-on-LAN 不需要——SmartThings API 可以直接开机（需在电视设置开启 Power On with Mobile）
+
 - RMT RX 收到三星 TM2360E 信号但 timing 失真：d0=76us（应为 560us），帧被碎片化
 - GPT 分析确认：三星 VG-TM2360E SolarCell Smart Remote 使用私有短协议（13 symbol / 21.5ms），非标准 NEC
 - 尝试 raw symbol 录音机模式（录什么放什么），回放无反应——76us mark 太短，电视 IR 接收器解调不了
