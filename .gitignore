@@ -1,0 +1,17 @@
+# Build artifacts
+build/
+*.bin
+*.elf
+*.hex
+
+# Arduino
+*.hex
+*.eep
+
+# OS
+.DS_Store
+*~
+
+# IDE
+.vscode/
+.idea/
