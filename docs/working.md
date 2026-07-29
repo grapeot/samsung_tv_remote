@@ -2,58 +2,58 @@
 
 ## Changelog
 
-### 2026-07-29 (continued)
-
-- SmartThings API 验证成功：开关电视、查状态都通过 `curl` 测试通过
-- 改为 WiFi + SmartThings API 方案，不再用红外
-- 固件：连 WiFi → 菜单选 Power/Vol+/Vol-/Mute/Source/CH+ → 发 SmartThings API HTTP 请求
-- Power 和 Mute 是 toggle：先查当前状态再发反向命令
-- secrets.h 存 WiFi SSID/password + SmartThings token + device ID，gitignored
-- 编译通过 36% Flash（WiFi+HTTPS 库较大）
-
-## Lessons Learned (continued)
-
-- SmartThings PAT 24 小时过期（2024-12-30 后创建的）。长期方案需要 OAuth2 app。
-- SmartThings API 命令格式：POST `https://api.smartthings.com/v1/devices/{deviceId}/commands`，body 是 `{"commands":[{"component":"main","capability":"switch","command":"on"}]}`
-- 查状态：GET `https://api.smartthings.com/v1/devices/{deviceId}/components/main/status`
-- 返回 `COMPLETED` = 同步完成，`ACCEPTED` = 异步已接受（大命令如开机可能先 ACCEPTED）
-- ESP32 WiFiClientSecure + `setInsecure()` 跳过证书验证，HTTPS 能正常工作
-- Wake-on-LAN 不需要——SmartThings API 可以直接开机（需在电视设置开启 Power On with Mobile）
-
-- RMT RX 收到三星 TM2360E 信号但 timing 失真：d0=76us（应为 560us），帧被碎片化
-- GPT 分析确认：三星 VG-TM2360E SolarCell Smart Remote 使用私有短协议（13 symbol / 21.5ms），非标准 NEC
-- 尝试 raw symbol 录音机模式（录什么放什么），回放无反应——76us mark 太短，电视 IR 接收器解调不了
-- 改为预设码方案：使用 IRremoteESP8266 库 sendSAMSUNG() 发送标准 Samsung32 码（Flipper IRDB + Arduino 论坛确认）
-- 三星 Neo QLED 8K 电视的 SolarCell 遥控器日常走蓝牙控制，红外 fallback 可能不工作
-- 待验证：用其他红外设备（非三星电视）测试发射功能是否正常
-
-## Lessons Learned (continued)
-
-- 三星 SolarCell Smart Remote（VG-TM2360E 等）高端型号日常走蓝牙，不走红外。红外只在蓝牙断开时 fallback。楼下按遥控器电视有反应 = 蓝牙控制。
-- Samsung32 协议：address byte 发两次（不是 address + inverse），然后 command + inverse。sendSAMSUNG() 接受完整 32-bit value。
-- 标准 Samsung power toggle = 0xE0E040BF（address=0x07, command=0x02），Arduino 论坛多用户确认。
-- IRremoteESP8266 的 API 是 sendSAMSUNG（全大写），不是 sendSamsung。
-- wasPressed() 在按下瞬间触发，会吞掉 wasDoubleClicked()。双击和单击并存时用 wasSingleClicked() + wasDoubleClicked()。
+### 2026-07-29
 
 - 项目 scaffold 完成：目录结构、AGENTS.md、README、PRD、RFC
 - 安装 M5Stack board package 3.3.8 + M5Unified 0.2.19 + M5GFX 0.2.26
 - 确认 FQBN: `m5stack:esp32:m5stack_sticks3`
-- 编写主固件 `src/ir_copier/ir_copier.ino`（Copy/Replay 菜单 + NEC 收发 + NVS 存储）
-- 编写编译/上传脚本
-- GPT review 发现多个 P0/P1 bug，全部修复：BtnPWR 硬件复位不可拦截、sketch 目录结构、长按删除无效、RX 取消、ISR 同步、NEC 校验、NVS blob 存储、满槽处理、Replay 返回菜单
-- PWR 电源键短按触发硬件复位，固件无法拦截。改为只用 BtnA + BtnB
-- 按钮映射确认：BtnA = 正面按钮（短按确认/进入，双击返回），BtnB = 侧面按钮（短按切换/翻页）
-- 固件编译上传成功，设备正常运行
-- RX 诊断配置改用 1 MHz XTAL 时钟，显式开启 GPIO42 pull-up，以 80 us 过滤毛刺、12 ms 判定帧结束，并在串口输出完整 symbol 和帧总时长
+- 刷 Bruce 固件验证 IR 硬件——发现黑屏 bug (#2371) + IR Read 抓噪声，放弃 Bruce
+- 编写 IR Copier 固件 v1：裸 RMT 收发 + NEC 解码 + NVS 存储
+- GPT review 发现 10 个 P0/P1 bug，全部修复
+- PWR 电源键短按触发硬件复位，不可拦截，改为只用 BtnA + BtnB
+- 按钮映射确认：BtnA=正面（短按确认/双击返回），BtnB=侧面（短按切换）
+- 刷入设备，UI 正常，但 IR RX 收到三星 TM2360E 信号 timing 严重失真（d0=76us）
+- GPT 分析确认：三星 SolarCell 遥控器走蓝牙，私有短协议非标准 NEC，StickS3 IR 接收器无法正确解调
+- 尝试 raw symbol 录音机模式回放——76us mark 太短，电视无反应
+- 改为 IRremoteESP8266 预设 Samsung32 码发送——电视仍无反应（电视日常走蓝牙控制）
+- 调研确认：三星 Neo QLED 8K 电视 SolarCell 遥控器走蓝牙，红外 fallback 不工作
+- 转向 SmartThings API 方案：通过 WiFi + HTTPS 控制 Samsung 电视
+- SmartThings PAT 生成、电视添加到 SmartThings、API 开关测试全部成功
+- 固件改为 WiFi + SmartThings API：菜单选 Power/Vol+/-/Mute/Source/CH+ → HTTP POST 到 SmartThings
+- secrets.h（gitignored）存 WiFi + SmartThings token + device ID
+- 编译上传成功，StickS3 成功开关电视
 
 ## Lessons Learned
 
-- StickS3 的 USB 是 ESP32-S3 原生 USB-Serial/JTAG，不是传统 UART 桥接芯片。pyserial 在 macOS 上对这个 CDC 设备握手不稳定，端口会频繁消失。解决方法：按住 BOOT 键插 USB 进 download mode，端口就稳定了，esptool 能连上。
-- Bruce 固件 v1.16 在 StickS3 上有已知 bug：背光初始化顺序导致黑屏（GitHub issue #2371），IR Read 抓到环境噪声不校验。这是自己写固件的动力。
-- StickS3 IR 接收前必须调用 `M5.Speaker.end()` 关闭功放，否则功放干扰 IR RX 信号。
-- M5Stack board package 和 espressif 原生 esp32 core 是两个不同的 package。StickS3 只在 M5Stack 的 package 里有 board 定义。FQBN 是 `m5stack:esp32:m5stack_sticks3`（注意不是 `m5sticks3`）。
-- PWR 电源键是 M5PM1 PMIC 硬件级控制，短按触发硬件复位，固件无法拦截。不要用 PWR 做 UI 操作。
-- Arduino 要求 .ino 文件放在同名目录下（`src/ir_copier/ir_copier.ino`），直接放 `src/ir_copier.ino` 会报 main file missing。
-- StickS3 有内置电池（250mAh），拔 USB 不会断电也不会重启。刷完固件后如果设备停在 download mode，需要拔插 USB 或快速按一下 PWR 键才能正常启动。
-- 按钮映射：正面按钮 = BtnA (GPIO11)，侧面按钮 = BtnB (GPIO12)。侧键翻页 + 正键确认符合横屏握持习惯。
-- M5Unified Button_Class 支持 wasDoubleClicked()，双击检测可靠。
+### 硬件 / 开发环境
+
+- StickS3 USB 是 ESP32-S3 原生 USB-Serial/JTAG，pyserial 在 macOS 上 CDC 握手不稳定。按住 BOOT 键插 USB 进 download mode 后端口稳定。
+- M5Stack board package ≠ espressif esp32 core。StickS3 board 定义只在 `m5stack:esp32` 包里。FQBN 是 `m5stack:esp32:m5stack_sticks3`。
+- Arduino 要求 .ino 放在同名目录下（`src/ir_copier/ir_copier.ino`）。
+- StickS3 内置 250mAh 电池，拔 USB 不断电。刷完固件后可能需要拔插或按一下 PWR 键才能正常启动。
+
+### 按钮系统
+
+- PWR 键是 M5PM1 PMIC 硬件级控制，短按触发硬件复位，固件无法拦截。不要用 PWR 做 UI。
+- BtnA = 正面按钮 (GPIO11)，BtnB = 侧面按钮 (GPIO12)。侧键翻页 + 正键确认符合横屏握持习惯。
+- wasPressed() 在按下瞬间触发，会吞掉 wasDoubleClicked()。双击+单击并存时用 wasSingleClicked() + wasDoubleClicked()。
+
+### 红外 IR
+
+- StickS3 IR 接收前必须 `M5.Speaker.end()` 关闭功放。
+- Bruce 固件 v1.16 在 StickS3 有黑屏 bug (#2371) + IR Read 不校验噪声。
+- 三星 SolarCell Smart Remote (VG-TM2360E) 日常走蓝牙不走红外，红外是 fallback。私有短协议（13 symbol / 21.5ms）无法被 StickS3 IR 接收器正确解调。
+- Samsung32 协议：address byte 发两次，然后 command + inverse。标准 power toggle = 0xE0E040BF。
+- IRremoteESP8266 的 API 是 `sendSAMSUNG`（全大写）。
+- 结论：对高端三星电视，红外方案不适用，改用 SmartThings API。
+
+### SmartThings API
+
+- PAT 24 小时过期（2024-12-30 后创建的）。长期方案需要 OAuth2 app。
+- 命令格式：POST `https://api.smartthings.com/v1/devices/{deviceId}/commands`，body `{"commands":[{"component":"main","capability":"switch","command":"on"}]}`
+- 查状态：GET `https://api.smartthings.com/v1/devices/{deviceId}/components/main/status`
+- 返回 `COMPLETED` = 同步完成，`ACCEPTED` = 异步已接受（开机可能先 ACCEPTED）
+- 电视需在设置中开启 "Power On with Mobile"（Settings → All Settings → Connections → Network → Expert Settings）
+- Wake-on-LAN 不需要——SmartThings API 可以直接开机
+- ESP32 WiFiClientSecure + `setInsecure()` 跳过证书验证，HTTPS 正常工作
+- 36% Flash 使用量（WiFi+HTTPS 库较大）
