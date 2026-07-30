@@ -16,6 +16,8 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include "esp_sleep.h"
+#include "driver/gpio.h"
 #include "secrets.h"
 
 #define IR_TX_PIN  46
@@ -35,6 +37,16 @@ bool actionBusy = false;
 unsigned long lastStatusFetch = 0;
 const unsigned long STATUS_INTERVAL = 10000; // 10 秒自动刷新
 
+// 背光与省电
+const int DEFAULT_BRIGHTNESS = 128;
+const int DIM_BRIGHTNESS = 26;  // ~20% of 128
+#define BACKLIGHT_DIM_TIMEOUT   15000   // 15 秒无操作减暗到 20%
+#define BACKLIGHT_OFF_TIMEOUT   60000   // 60 秒无操作熄灭背光
+#define LIGHTSLEEP_TIMEOUT     120000   // 120 秒无操作进 light sleep
+unsigned long lastActivity = 0;
+int currentBrightness = DEFAULT_BRIGHTNESS;
+bool sleeping = false;
+
 #define COLOR_HINT TFT_DARKGREY
 #define COLOR_DIM  0x630C  // ~#505050 深灰
 
@@ -46,6 +58,8 @@ bool togglePower();
 void drawMain(bool busy = false);
 void drawStatus();
 void drawConnecting();
+void enterLightSleep();
+void wakeUp();
 
 // ==================== Setup ====================
 
@@ -58,6 +72,7 @@ void setup() {
   Serial.println("Samsung TV Remote starting...");
 
   M5.Display.setRotation(0);  // 竖屏 135x240
+  M5.Display.setBrightness(DEFAULT_BRIGHTNESS);
   M5.Display.clear();
 
   drawConnecting();
@@ -77,6 +92,7 @@ void setup() {
   tvConfigured = (strlen(ST_TOKEN) > 0 && strlen(ST_DEVICE_ID) > 0);
   fetchTVStatus();
   drawMain();
+  lastActivity = millis();
   Serial.println("Ready.");
 }
 
@@ -85,12 +101,39 @@ void setup() {
 void loop() {
   M5.update();
 
-  // 自动刷新状态
-  if (millis() - lastStatusFetch > STATUS_INTERVAL && !actionBusy) {
-    fetchTVStatus();
-    if (currentScreen == SCREEN_MAIN) drawMain();
-    else if (currentScreen == SCREEN_STATUS) drawStatus();
+  // 检测任意按钮活动
+  bool anyButton = M5.BtnA.wasPressed() || M5.BtnA.wasSingleClicked() ||
+                   M5.BtnA.wasDoubleClicked() || M5.BtnB.wasPressed();
+  if (anyButton) {
+    lastActivity = millis();
+    if (sleeping) {
+      wakeUp();
+    }
   }
+
+  // 背光三级省电：15s 减暗 → 60s 熄灭 → 120s light sleep
+  if (!actionBusy && !sleeping) {
+    unsigned long idle = millis() - lastActivity;
+    if (idle > LIGHTSLEEP_TIMEOUT) {
+      enterLightSleep();
+      return;
+    } else if (idle > BACKLIGHT_OFF_TIMEOUT) {
+      if (currentBrightness != 0) {
+        M5.Display.setBrightness(0);
+        currentBrightness = 0;
+        Serial.println("Backlight off");
+      }
+    } else if (idle > BACKLIGHT_DIM_TIMEOUT) {
+      if (currentBrightness != DIM_BRIGHTNESS) {
+        M5.Display.setBrightness(DIM_BRIGHTNESS);
+        currentBrightness = DIM_BRIGHTNESS;
+        Serial.println("Backlight dim");
+      }
+    }
+  }
+
+  // 不再自动轮询状态。只在按钮操作后刷新。
+  // 按钮操作后会 fetchTVStatus + 重绘一次。
 
   if (actionBusy) {
     delay(10);
@@ -99,6 +142,11 @@ void loop() {
 
   if (currentScreen == SCREEN_MAIN) {
     if (M5.BtnA.wasSingleClicked()) {
+      // 确保背光亮着
+      if (currentBrightness != DEFAULT_BRIGHTNESS) {
+        currentBrightness = DEFAULT_BRIGHTNESS;
+        M5.Display.setBrightness(DEFAULT_BRIGHTNESS);
+      }
       actionBusy = true;
       drawMain(true);  // 显示 busy
       bool ok = togglePower();
@@ -125,6 +173,49 @@ void loop() {
   }
 
   delay(10);
+}
+
+// ==================== 省电 ====================
+
+void enterLightSleep() {
+  Serial.println("Entering light sleep...");
+  sleeping = true;
+
+  // 配置 GPIO11 (BtnA) 和 GPIO12 (BtnB) 为低电平唤醒
+  gpio_wakeup_enable(GPIO_NUM_11, gpio_int_type_t::GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable(GPIO_NUM_12, gpio_int_type_t::GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+
+  // 进入 light sleep，WiFi 保持关联但降功耗
+  esp_light_sleep_start();
+
+  // 唤醒后
+  Serial.println("Woke up from light sleep");
+  sleeping = false;
+  lastActivity = millis();
+}
+
+void wakeUp() {
+  Serial.println("Waking up...");
+  sleeping = false;
+  currentBrightness = DEFAULT_BRIGHTNESS;
+  M5.Display.setBrightness(DEFAULT_BRIGHTNESS);
+  lastActivity = millis();
+
+  // 确认 WiFi 还连着
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected, reconnecting...");
+    WiFi.reconnect();
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start < 5000)) {
+      delay(100);
+    }
+  }
+
+  // 刷新状态
+  fetchTVStatus();
+  if (currentScreen == SCREEN_MAIN) drawMain();
+  else drawStatus();
 }
 
 // ==================== WiFi ====================

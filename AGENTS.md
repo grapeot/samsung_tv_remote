@@ -1,12 +1,14 @@
-# AGENTS.md — IR Copier 项目
+# AGENTS.md — Samsung TV Remote (M5StickS3)
 
 ## 项目概述
 
-M5StickS3 红外遥控器复制器固件。极简 UI：Copy / Replay 双菜单，NEC 协议收发，flash 持久化存储。
+M5StickS3 Samsung 电视遥控器固件。WiFi + SmartThings API，竖屏白底 UI。BtnA 开关电视，BtnB 查看状态。
 
 ## 项目结构
 
-- `src/ir_copier.ino` — 主固件，所有逻辑在此单文件
+- `src/samsung_tv_remote/samsung_tv_remote.ino` — 主固件
+- `src/samsung_tv_remote/secrets.h` — 凭证（gitignored）
+- `src/samsung_tv_remote/secrets.example.h` — 凭证模板
 - `scripts/build.sh` — arduino-cli 编译脚本
 - `scripts/upload.sh` — arduino-cli 上传脚本
 - `docs/prd.md` — 产品需求
