@@ -2,7 +2,13 @@
 
 ## Changelog
 
-### 2026-07-29
+### 2026-07-29 (final)
+
+- 项目从 IR Copier 改名为 Samsung TV Remote
+- UI 重设计：竖屏白底黑字，FreeSansBold24pt7b 大字 ON/OFF，分割线，状态页左右对齐
+- GPT review 建议：原生大字替代像素放大、状态有效性标记、SSID 截断、WiFi 失败页
+- 按钮方案：BtnA 短按=开关电视，BtnB 短按=状态页，状态页任意键返回
+- 10 秒自动刷新状态，toggle 后乐观更新 + 2 秒延迟确认
 
 - 项目 scaffold 完成：目录结构、AGENTS.md、README、PRD、RFC
 - 安装 M5Stack board package 3.3.8 + M5Unified 0.2.19 + M5GFX 0.2.26

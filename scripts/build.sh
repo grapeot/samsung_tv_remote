@@ -5,7 +5,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$PROJECT_ROOT/build"
-SKETCH="$PROJECT_ROOT/src/ir_copier/ir_copier.ino"
+SKETCH="$PROJECT_ROOT/src/samsung_tv_remote/samsung_tv_remote.ino"
 
 FQBN="m5stack:esp32:m5stack_sticks3"
 PORT="${PORT:-/dev/cu.usbmodem101}"

@@ -29,7 +29,7 @@ arduino-cli upload \
   --fqbn "$FQBN" \
   --port "$PORT" \
   --build-path "$BUILD_DIR" \
-  "$PROJECT_ROOT/src/ir_copier/ir_copier.ino"
+  "$PROJECT_ROOT/src/samsung_tv_remote/samsung_tv_remote.ino"
 
 echo ""
 echo "=== Upload complete ==="
