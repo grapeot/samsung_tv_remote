@@ -58,6 +58,7 @@ bool togglePower();
 void drawMain(bool busy = false);
 void drawStatus();
 void drawConnecting();
+void drawBatteryIcon(int x, int y, int level);
 void enterLightSleep();
 void wakeUp();
 
@@ -309,6 +310,31 @@ bool togglePower() {
 
 // ==================== UI ====================
 
+void drawBatteryIcon(int x, int y, int level) {
+  // 电池图标：外壳 20x10, 电极在左侧
+  // level: 0-100
+  int w = 20, h = 10;
+  uint16_t color = (level < 20) ? TFT_RED : TFT_BLACK;
+
+  // 电极（左侧小凸起）
+  M5.Display.fillRect(x, y + 3, 2, 4, color);
+  // 外壳（从电极右侧开始）
+  M5.Display.drawRect(x + 2, y, w, h, color);
+
+  // 电量条（从外壳内部右侧填充，正极在左所以条从左往右）
+  int barW = (w - 4) * level / 100;
+  if (barW > 0) {
+    M5.Display.fillRect(x + 4, y + 2, barW, h - 4, color);
+  }
+
+  // 百分比文字（右侧，留够 3 位 + %）
+  M5.Display.setFont(&fonts::Font0);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextDatum(TL_DATUM);
+  M5.Display.setTextColor(color, TFT_WHITE);
+  M5.Display.drawString(String(level) + "%", x + 2 + w + 6, y + 1);
+}
+
 void drawConnecting() {
   M5.Display.clear();
   M5.Display.fillScreen(TFT_WHITE);
@@ -331,6 +357,12 @@ void drawConnecting() {
 void drawMain(bool busy) {
   M5.Display.clear();
   M5.Display.fillScreen(TFT_WHITE);
+
+  // 电池图标右上角（图标左侧约 x=75，文字到右边）
+  int battLevel = M5.Power.getBatteryLevel();
+  if (battLevel < 0) battLevel = 0;
+  if (battLevel > 100) battLevel = 100;
+  drawBatteryIcon(78, 4, battLevel);
 
   M5.Display.setTextDatum(MC_DATUM);
 
