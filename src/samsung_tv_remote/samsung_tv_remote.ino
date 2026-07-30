@@ -17,6 +17,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include "esp_sleep.h"
+#include "esp_wifi.h"
 #include "driver/gpio.h"
 #include "secrets.h"
 
@@ -65,8 +66,15 @@ void wakeUp();
 // ==================== Setup ====================
 
 void setup() {
-  M5.begin();
-  M5.Speaker.end();
+  auto cfg = M5.config();
+  cfg.internal_imu = false;    // 不用 IMU，省电
+  cfg.internal_mic = false;     // 不用麦克风
+  cfg.internal_spk = false;     // 不用扬声器
+  cfg.output_power = false;     // 不用外部 5V
+  M5.begin(cfg);
+
+  // CPU 降到 80MHz，省电；WiFi 和 TLS 在此频率仍可工作
+  setCpuFrequencyMhz(80);
 
   Serial.begin(115200);
   delay(500);
@@ -161,11 +169,9 @@ void loop() {
       drawMain(true);  // 显示 busy
       bool ok = togglePower();
       if (ok) {
-        // 乐观翻转
         tvOn = !tvOn;
+        tvStatusValid = true;
       }
-      delay(2000);
-      fetchTVStatus();
       drawMain();
       actionBusy = false;
     }
@@ -183,7 +189,7 @@ void loop() {
   }
 
   // yield 让 CPU 进 idle，避免忙转发热
-  vTaskDelay(pdMS_TO_TICKS(10));
+  vTaskDelay(pdMS_TO_TICKS(50));
 }
 
 // ==================== 省电 ====================
@@ -234,7 +240,9 @@ void wakeUp() {
 bool connectWiFi() {
   Serial.printf("Connecting to %s\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(true);  // 开启 modem sleep，WiFi 空闲时降功耗
+  WiFi.setSleep(true);
+  WiFi.setTxPower(WIFI_POWER_13dBm);  // 室内 13dBm 够用
+  esp_wifi_set_ps(WIFI_PS_MAX_MODEM);  // 最激进 modem sleep
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
   unsigned long start = millis();
@@ -272,7 +280,7 @@ bool sendCommand(const char *capability, const char *command) {
   int code = http.POST(body);
   http.end();
   Serial.printf("CMD %s/%s -> %d\n", capability, command, code);
-  return (code == 200);
+  return (code >= 200 && code < 300);  // 接受 2xx
 }
 
 bool fetchTVStatus() {
