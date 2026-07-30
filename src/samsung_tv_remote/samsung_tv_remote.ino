@@ -58,7 +58,7 @@ bool togglePower();
 void drawMain(bool busy = false);
 void drawStatus();
 void drawConnecting();
-void drawBatteryIcon(int x, int y, int level);
+void drawBatteryIcon(int x, int y, int level, bool charging = false);
 void enterLightSleep();
 void wakeUp();
 
@@ -104,11 +104,20 @@ void loop() {
 
   // 检测任意按钮活动
   bool anyButton = M5.BtnA.wasPressed() || M5.BtnA.wasSingleClicked() ||
-                   M5.BtnA.wasDoubleClicked() || M5.BtnB.wasPressed();
+                   M5.BtnA.wasDoubleClicked() || M5.BtnB.wasPressed() ||
+                   M5.BtnB.wasSingleClicked() || M5.BtnB.wasDoubleClicked();
   if (anyButton) {
     lastActivity = millis();
+    // 如果背光不亮，先亮起来，不处理按钮动作
+    if (currentBrightness != DEFAULT_BRIGHTNESS) {
+      currentBrightness = DEFAULT_BRIGHTNESS;
+      M5.Display.setBrightness(DEFAULT_BRIGHTNESS);
+      // 消费掉这次按钮事件，下一轮再处理实际动作
+      return;
+    }
     if (sleeping) {
       wakeUp();
+      return;
     }
   }
 
@@ -137,7 +146,7 @@ void loop() {
   // 按钮操作后会 fetchTVStatus + 重绘一次。
 
   if (actionBusy) {
-    delay(10);
+    vTaskDelay(pdMS_TO_TICKS(10));
     return;
   }
 
@@ -173,7 +182,8 @@ void loop() {
     }
   }
 
-  delay(10);
+  // yield 让 CPU 进 idle，避免忙转发热
+  vTaskDelay(pdMS_TO_TICKS(10));
 }
 
 // ==================== 省电 ====================
@@ -224,6 +234,7 @@ void wakeUp() {
 bool connectWiFi() {
   Serial.printf("Connecting to %s\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(true);  // 开启 modem sleep，WiFi 空闲时降功耗
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
   unsigned long start = millis();
@@ -310,29 +321,38 @@ bool togglePower() {
 
 // ==================== UI ====================
 
-void drawBatteryIcon(int x, int y, int level) {
-  // 电池图标：外壳 20x10, 电极在左侧
-  // level: 0-100
-  int w = 20, h = 10;
-  uint16_t color = (level < 20) ? TFT_RED : TFT_BLACK;
-
-  // 电极（左侧小凸起）
-  M5.Display.fillRect(x, y + 3, 2, 4, color);
-  // 外壳（从电极右侧开始）
-  M5.Display.drawRect(x + 2, y, w, h, color);
-
-  // 电量条（从外壳内部右侧填充，正极在左所以条从左往右）
-  int barW = (w - 4) * level / 100;
-  if (barW > 0) {
-    M5.Display.fillRect(x + 4, y + 2, barW, h - 4, color);
+void drawBatteryIcon(int x, int y, int level, bool charging) {
+  // 电池图标：电极在左侧（正极朝左），电量条从右往左长
+  // level: 0-100, charging: 充电时变黄
+  int w = 22, h = 12;
+  uint16_t color;
+  if (charging) {
+    color = 0xFE40;  // 黄色
+  } else if (level < 20) {
+    color = TFT_RED;
+  } else {
+    color = TFT_BLACK;
   }
 
-  // 百分比文字（右侧，留够 3 位 + %）
+  // 电极（左侧小凸起）
+  M5.Display.fillRect(x, y + 3, 3, 6, color);
+  // 外壳
+  int bodyX = x + 3;
+  M5.Display.drawRect(bodyX, y, w, h, color);
+
+  // 电量条：从外壳内部右端开始，向左填充
+  int innerW = w - 4;
+  int barW = innerW * level / 100;
+  if (barW > 0) {
+    M5.Display.fillRect(bodyX + 2 + (innerW - barW), y + 2, barW, h - 4, color);
+  }
+
+  // 百分比文字
   M5.Display.setFont(&fonts::Font0);
   M5.Display.setTextSize(1);
   M5.Display.setTextDatum(TL_DATUM);
   M5.Display.setTextColor(color, TFT_WHITE);
-  M5.Display.drawString(String(level) + "%", x + 2 + w + 6, y + 1);
+  M5.Display.drawString(String(level) + "%", bodyX + w + 6, y + 2);
 }
 
 void drawConnecting() {
@@ -358,11 +378,12 @@ void drawMain(bool busy) {
   M5.Display.clear();
   M5.Display.fillScreen(TFT_WHITE);
 
-  // 电池图标右上角（图标左侧约 x=75，文字到右边）
+  // 电池图标右上角，充电时变黄
   int battLevel = M5.Power.getBatteryLevel();
   if (battLevel < 0) battLevel = 0;
   if (battLevel > 100) battLevel = 100;
-  drawBatteryIcon(78, 4, battLevel);
+  bool charging = (M5.Power.isCharging() == m5::Power_Class::is_charging);
+  drawBatteryIcon(68, 4, battLevel, charging);
 
   M5.Display.setTextDatum(MC_DATUM);
 
