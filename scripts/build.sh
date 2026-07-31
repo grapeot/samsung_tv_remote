@@ -12,7 +12,7 @@ PORT="${PORT:-/dev/cu.usbmodem101}"
 
 mkdir -p "$BUILD_DIR"
 
-echo "=== Compiling IR Copier for M5StickS3 ==="
+echo "=== Compiling Samsung TV Remote for M5StickS3 ==="
 echo "FQBN: $FQBN"
 echo "Sketch: $SKETCH"
 echo ""
@@ -24,4 +24,4 @@ arduino-cli compile \
 
 echo ""
 echo "=== Build complete ==="
-echo "Output: $BUILD_DIR/ir_copier.ino.bin"
+echo "Output: $BUILD_DIR/samsung_tv_remote.ino.bin"
