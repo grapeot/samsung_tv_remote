@@ -1,32 +1,27 @@
-# Working — IR Copier 开发日志
+# Working — Samsung TV Remote 开发日志
 
 ## Changelog
+
+### 2026-07-30
+
+- 从 SmartThings 云 API 迁移到本地 Tizen WebSocket API（wss://TV_IP:8002）
+- 消除 SmartThings PAT 24h 过期问题
+- 配对 token 存入 NVS（Preferences），首次配对后长期复用
+- 固件重写：ArduinoWebsockets 库替代 HTTPClient，通过 WS 发 key 事件
+- 状态查询改用 REST 端点 `https://TV_IP:8002/api/v2/` 的 PowerState
+- 状态页 volume/muted 改为 "N/A"（本地协议不可读）
+- secrets.h 简化：只需 WiFi + TV_HOST，token 自动配对存 NVS
+- 新增配对流程 UI：首次运行显示 "Press ALLOW on TV screen"
+- 文档全部重写（PRD/RFC/working.md/README/AGENTS.md）
 
 ### 2026-07-29 (final)
 
 - 项目从 IR Copier 改名为 Samsung TV Remote
-- UI 重设计：竖屏白底黑字，FreeSansBold24pt7b 大字 ON/OFF，分割线，状态页左右对齐
-- GPT review 建议：原生大字替代像素放大、状态有效性标记、SSID 截断、WiFi 失败页
-- 按钮方案：BtnA 短按=开关电视，BtnB 短按=状态页，状态页任意键返回
-- 10 秒自动刷新状态，toggle 后乐观更新 + 2 秒延迟确认
-
-- 项目 scaffold 完成：目录结构、AGENTS.md、README、PRD、RFC
-- 安装 M5Stack board package 3.3.8 + M5Unified 0.2.19 + M5GFX 0.2.26
-- 确认 FQBN: `m5stack:esp32:m5stack_sticks3`
-- 刷 Bruce 固件验证 IR 硬件——发现黑屏 bug (#2371) + IR Read 抓噪声，放弃 Bruce
-- 编写 IR Copier 固件 v1：裸 RMT 收发 + NEC 解码 + NVS 存储
-- GPT review 发现 10 个 P0/P1 bug，全部修复
-- PWR 电源键短按触发硬件复位，不可拦截，改为只用 BtnA + BtnB
-- 按钮映射确认：BtnA=正面（短按确认/双击返回），BtnB=侧面（短按切换）
-- 刷入设备，UI 正常，但 IR RX 收到三星 TM2360E 信号 timing 严重失真（d0=76us）
-- GPT 分析确认：三星 SolarCell 遥控器走蓝牙，私有短协议非标准 NEC，StickS3 IR 接收器无法正确解调
-- 尝试 raw symbol 录音机模式回放——76us mark 太短，电视无反应
-- 改为 IRremoteESP8266 预设 Samsung32 码发送——电视仍无反应（电视日常走蓝牙控制）
-- 调研确认：三星 Neo QLED 8K 电视 SolarCell 遥控器走蓝牙，红外 fallback 不工作
-- 转向 SmartThings API 方案：通过 WiFi + HTTPS 控制 Samsung 电视
-- SmartThings PAT 生成、电视添加到 SmartThings、API 开关测试全部成功
-- 固件改为 WiFi + SmartThings API：菜单选 Power/Vol+/-/Mute/Source/CH+ → HTTP POST 到 SmartThings
-- secrets.h（gitignored）存 WiFi + SmartThings token + device ID
+- UI 重设计：竖屏白底黑字，FreeSansBold24pt7b 大字 ON/OFF
+- 按钮方案：BtnA 短按=开关电视，BtnB 短按=状态页
+- 转向 SmartThings API 方案（已废弃，见上方迁移）
+- SmartThings PAT 生成、电视添加到 SmartThings、API 开关测试成功
+- 固件改为 WiFi + SmartThings API
 - 编译上传成功，StickS3 成功开关电视
 
 ## Lessons Learned
@@ -35,31 +30,33 @@
 
 - StickS3 USB 是 ESP32-S3 原生 USB-Serial/JTAG，pyserial 在 macOS 上 CDC 握手不稳定。按住 BOOT 键插 USB 进 download mode 后端口稳定。
 - M5Stack board package ≠ espressif esp32 core。StickS3 board 定义只在 `m5stack:esp32` 包里。FQBN 是 `m5stack:esp32:m5stack_sticks3`。
-- Arduino 要求 .ino 放在同名目录下（`src/ir_copier/ir_copier.ino`）。
 - StickS3 内置 250mAh 电池，拔 USB 不断电。刷完固件后可能需要拔插或按一下 PWR 键才能正常启动。
 
 ### 按钮系统
 
 - PWR 键是 M5PM1 PMIC 硬件级控制，短按触发硬件复位，固件无法拦截。不要用 PWR 做 UI。
-- BtnA = 正面按钮 (GPIO11)，BtnB = 侧面按钮 (GPIO12)。侧键翻页 + 正键确认符合横屏握持习惯。
+- BtnA = 正面按钮 (GPIO11)，BtnB = 侧面按钮 (GPIO12)。
 - wasPressed() 在按下瞬间触发，会吞掉 wasDoubleClicked()。双击+单击并存时用 wasSingleClicked() + wasDoubleClicked()。
 
-### 红外 IR
+### 红外 IR（已废弃）
 
-- StickS3 IR 接收前必须 `M5.Speaker.end()` 关闭功放。
-- Bruce 固件 v1.16 在 StickS3 有黑屏 bug (#2371) + IR Read 不校验噪声。
-- 三星 SolarCell Smart Remote (VG-TM2360E) 日常走蓝牙不走红外，红外是 fallback。私有短协议（13 symbol / 21.5ms）无法被 StickS3 IR 接收器正确解调。
-- Samsung32 协议：address byte 发两次，然后 command + inverse。标准 power toggle = 0xE0E040BF。
-- IRremoteESP8266 的 API 是 `sendSAMSUNG`（全大写）。
-- 结论：对高端三星电视，红外方案不适用，改用 SmartThings API。
+- 三星 SolarCell Smart Remote 走蓝牙，红外 fallback 不工作。StickS3 IR 接收器无法解调私有短协议。
+- 结论：对高端三星电视，红外方案不适用。
 
-### SmartThings API
+### SmartThings API（已废弃）
 
-- PAT 24 小时过期（2024-12-30 后创建的）。长期方案需要 OAuth2 app。
-- 命令格式：POST `https://api.smartthings.com/v1/devices/{deviceId}/commands`，body `{"commands":[{"component":"main","capability":"switch","command":"on"}]}`
-- 查状态：GET `https://api.smartthings.com/v1/devices/{deviceId}/components/main/status`
-- 返回 `COMPLETED` = 同步完成，`ACCEPTED` = 异步已接受（开机可能先 ACCEPTED）
-- 电视需在设置中开启 "Power On with Mobile"（Settings → All Settings → Connections → Network → Expert Settings）
-- Wake-on-LAN 不需要——SmartThings API 可以直接开机
+- PAT 24 小时过期（2024-12-30 后创建的）。长期方案需要本地 WS API。
+- 命令格式：POST `https://api.smartthings.com/v1/devices/{deviceId}/commands`
 - ESP32 WiFiClientSecure + `setInsecure()` 跳过证书验证，HTTPS 正常工作
 - 36% Flash 使用量（WiFi+HTTPS 库较大）
+
+### 本地 Tizen WebSocket API
+
+- Token 是设备本地一次性凭证，不过期。首次配对在电视屏幕按"允许"即可。
+- KEY_POWER 是 toggle，不是绝对 on/off。遥控器只做 toggle。
+- Volume 和 Muted 不可读。本地 WS 协议只发 key 事件，不返回音量或静音状态。
+- 一个连接一个 key。连续多 key 触发 ConnectionResetError，每次新建连接。
+- QN900C 浅待机态端口 8002 仍存活，KEY_POWER 可从待机唤醒。
+- PowerState 瞬态：关机后短暂返回空字符串，需等几秒后查询才稳定。
+- ArduinoWebsockets 库支持 WSS + 自签证书跳过（beginSslWithBin）。
+- 配对 token 存 NVS（Preferences），不写入 secrets.h，断电不丢失。

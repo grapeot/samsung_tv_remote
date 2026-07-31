@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-M5StickS3 Samsung 电视遥控器固件。WiFi + SmartThings API，竖屏白底 UI。BtnA 开关电视，BtnB 查看状态。
+M5StickS3 Samsung 电视遥控器固件。WiFi + 本地 Tizen WebSocket API（wss://TV_IP:8002），竖屏白底 UI。BtnA 开关电视，BtnB 查看状态。首次运行自动配对，token 存 NVS。
 
 ## 项目结构
 

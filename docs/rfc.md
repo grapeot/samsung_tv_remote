@@ -1,84 +1,81 @@
-# RFC — IR Copier 技术设计
+# RFC — Samsung TV Remote 技术设计
+
+## 架构变更：SmartThings 云 API → 本地 Tizen WebSocket API
+
+原方案通过 SmartThings 云 API（HTTPS + PAT）控制电视。SmartThings PAT 24 小时过期，不适合 always-on 遥控器。新方案改为本地 Tizen WebSocket API（wss://TV_IP:8002），token 是设备本地一次性凭证，不过期。
+
+## 本地 Tizen WS 协议
+
+### 连接
+
+```
+wss://TV_IP:8002/api/v2/channels/samsung.remote.control?name=<base64_app_name>&token=<token>
+```
+
+- Port 8002 (WSS, 自签证书，跳过验证)
+- `name`: base64 编码的应用名（显示在电视授权框和允许设备列表中）
+- `token`: 首次配对时电视返回的本地 token，后续复用
+
+### 配对流程
+
+1. 连接 WS（不带 token）
+2. 电视屏幕弹出"是否允许 [AppName] 连接"授权框
+3. 用户在电视上按"允许"
+4. 电视在 `ms.channel.connect` 事件中返回 token
+5. token 存入 NVS（Preferences），后续连接带上 token 免授权
+
+### Key 事件
+
+```json
+{
+  "method": "ms.remote.control",
+  "params": {
+    "Cmd": "Click",
+    "DataOfCmd": "KEY_POWER",
+    "Option": "false",
+    "TypeOfRemote": "SendRemoteKey"
+  }
+}
+```
+
+支持的 key：`KEY_POWER`, `KEY_VOLUP`, `KEY_VOLDOWN`, `KEY_MUTE`, `KEY_HOME`, `KEY_SOURCE` 等。
+
+### 状态查询
+
+REST 端点 `https://TV_IP:8002/api/v2/` 返回设备信息 JSON，包含 `device.PowerState`（`on` / `standby` / 瞬态空字符串）。
+
+### 协议限制
+
+- **KEY_POWER 是 toggle**，不是绝对 on/off。遥控器只做 toggle。
+- **Volume 和 Muted 不可读**。本地 WS 协议只发 key 事件，不返回当前音量或静音状态。
+- **一个连接一个 key**。连续多 key 会触发 `ConnectionResetError`，每次发 key 新建连接。
+- **浅待机端口存活**。QN900C 待机态 8002 端口仍可达，KEY_POWER 可唤醒。
 
 ## 硬件
 
-M5StickS3 内置 IR 收发器：
-- IR_TX: GPIO 46（IR LED 发射）
-- IR_RX: GPIO 42（IR 接收器）
+M5StickS3 (ESP32-S3-PICO-1-N8R8)：
+- WiFi 用于 WS 连接
+- 135x240 ST7789 LCD 竖屏
+- 250mAh 电池
+- BtnA (GPIO11) + BtnB (GPIO12)
 
-IR 收发使用 ESP32-S3 的 RMT 外设（不是 GPIO 轮询），分别用 `driver/rmt_tx.h` 和 `driver/rmt_rx.h` 驱动。38kHz 载波频率。
+## 库依赖
 
-## NEC 协议
+- M5Unified + M5GFX（UI）
+- ArduinoWebsockets（WSS 连接，自签证书跳过）
+- ArduinoJson（解析配对响应）
+- Preferences（NVS 存储 token）
 
-NEC 帧 = 9ms mark + 4.5ms space（引导码）+ 32 bit 数据 + 560us 结尾 mark。
+## 省电策略
 
-32 bit 结构（LSB first）：
-- bit 0-7: 地址
-- bit 8-15: 地址反码
-- bit 16-23: 命令
-- bit 24-31: 命令反码
+- CPU 80MHz
+- WiFi MAX_MODEM sleep
+- TX 13dBm
+- 背光三级：15s dim → 60s off → 120s light sleep
+- Light sleep 保留 WiFi 关联，GPIO 唤醒
 
-校验：地址 ^ 地址反 == 0xFF 且 命令 ^ 命令反 == 0xFF。
+## 安全考量
 
-## 架构决策
-
-### 单文件固件
-
-项目逻辑简单（菜单 + 收 + 发 + 存），不需要拆分模块。全部放 `src/ir_copier.ino`。
-
-### RMT 直接驱动 vs IRremoteESP8266 库
-
-选择 RMT 直接驱动（跟官方例程一致），原因：
-- M5Stack 官方 StickS3 IR NEC 例程用的就是 RMT API
-- 不引入额外库依赖
-- RMT 是 ESP32-S3 硬件外设，精度最高
-- IRremoteESP8266 对 StickS3 的支持不如官方例程成熟
-
-### 存储：Preferences (NVS) vs LittleFS
-
-选择 Preferences (NVS)，原因：
-- 只需存几个 32 位整数 + 标签，NVS 的 key-value 模型完全够用
-- 不需要文件系统
-- NVS 是 ESP-IDF 原生持久化，断电安全
-- API 简单：`prefs.putULong("slot0", code)`
-
-### 噪声去抖
-
-Bruce 固件的问题是 IR Read 无差别地把所有 RMT 接收到的信号都显示出来，包括环境噪声。本固件的去抖策略：
-1. 只接受通过 NEC 协议校验的帧（地址反码 + 命令反码双重校验）
-2. 引导码时间窗口校验（mark 8000-10000us，space 4000-5000us）
-3. 每个数据 bit 的 mark 时长校验（300-800us）
-4. 校验失败的帧静默丢弃，不显示
-
-### UI 状态机
-
-```
-MENU_COPY_REPLAY
-  ├── Copy → COPY_WAITING → COPY_RECEIVED → MENU_COPY_REPLAY
-  └── Replay → REPLAY_LIST → REPLAY_SEND → REPLAY_LIST
-```
-
-### 按钮
-
-StickS3 有三个按钮：
-- GPIO 11 (BtnA / 侧面下键) — 导航
-- GPIO 12 (BtnB / 侧面上键) — 导航
-- GPIO 0 (Power/Select) — 确认/选择
-
-用 M5Unified 的 `M5.BtnA`/`M5.BtnB`/`M5.BtnPWR` 读取。
-
-## 引脚定义
-
-```
-IR_TX = 46
-IR_RX = 42
-BTN_A = 11  (导航)
-BTN_B = 12  (导航)
-BTN_PWR = 0 (确认)
-```
-
-## 显示
-
-- ST7789P3, 135x240, 旋转 3（landscape）
-- 字体：FreeMonoBold9pt7b
-- 菜单高亮：反白显示选中项
+- WSS 自签证书跳过验证（LAN 信任模型，同 smart_home service）
+- Token 存 NVS，不写入 secrets.h
+- Token 不过期但可被电视端撤销（重新配对即可）

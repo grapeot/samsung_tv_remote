@@ -1,13 +1,17 @@
 /*
  * Samsung TV Remote — M5StickS3
  *
- * 极简三星电视遥控器。通过 WiFi + SmartThings API 控制。
+ * Local Tizen WebSocket API 版本（替代 SmartThings 云 PAT）。
+ * 通过 wss://TV_IP:8002 本地 WebSocket 控制电视，无需 24h 过期 token。
  *
  * UI:
  *   主屏：大字显示电视 ON / OFF 状态
- *   BtnA (正面) 短按 = 开关电视 (toggle power)
- *   BtnB (侧面) 短按 = 状态页 (音量、静音、IP)
+ *   BtnA (正面) 短按 = 开关电视 (KEY_POWER toggle)
+ *   BtnB (侧面) 短按 = 状态页 (IP、SSID、配对状态)
  *   状态页按任意键返回主屏
+ *
+ * 配对：首次运行时连接电视 WS，电视屏幕弹出授权框，
+ *       用户按允许后 token 存入 NVS，后续自动复用。
  *
  * 硬件：M5StickS3 (ESP32-S3, WiFi)
  */
@@ -16,6 +20,9 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <ArduinoWebsockets.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
 #include "esp_sleep.h"
 #include "esp_wifi.h"
 #include "driver/gpio.h"
@@ -24,41 +31,56 @@
 #define IR_TX_PIN  46
 #define IR_RX_PIN  42
 
+// ==================== 常量 ====================
+
+#define WS_PORT   8002
+#define WS_PATH   "/api/v2/channels/samsung.remote.control"
+#define REST_PATH "/api/v2/"
+#define POWER_SETTLE_MS  3000
+#define APP_NAME_B64 "U21hcnRIb21l"  // base64("SmartHome")
+
 // ==================== UI 状态 ====================
 
-enum Screen { SCREEN_MAIN, SCREEN_STATUS };
+enum Screen { SCREEN_MAIN, SCREEN_STATUS, SCREEN_PAIRING };
 Screen currentScreen = SCREEN_MAIN;
 
 bool tvOn = false;
 bool tvStatusValid = false;
-int tvVolume = 0;
-bool tvMuted = false;
 bool tvConfigured = false;
 bool actionBusy = false;
-unsigned long lastStatusFetch = 0;
-const unsigned long STATUS_INTERVAL = 10000; // 10 秒自动刷新
 
-// 背光与省电
 const int DEFAULT_BRIGHTNESS = 128;
-const int DIM_BRIGHTNESS = 26;  // ~20% of 128
-#define BACKLIGHT_DIM_TIMEOUT   15000   // 15 秒无操作减暗到 20%
-#define BACKLIGHT_OFF_TIMEOUT   60000   // 60 秒无操作熄灭背光
-#define LIGHTSLEEP_TIMEOUT     120000   // 120 秒无操作进 light sleep
+const int DIM_BRIGHTNESS = 26;
+#define BACKLIGHT_DIM_TIMEOUT   15000
+#define BACKLIGHT_OFF_TIMEOUT   60000
+#define LIGHTSLEEP_TIMEOUT     120000
 unsigned long lastActivity = 0;
 int currentBrightness = DEFAULT_BRIGHTNESS;
 bool sleeping = false;
 
-#define COLOR_HINT TFT_DARKGREY
-#define COLOR_DIM  0x630C  // ~#505050 深灰
+#define COLOR_DIM  0x630C
+
+// ==================== WS 客户端 ====================
+
+websockets::WebsocketsClient wsClient;
+Preferences prefs;
+String wsToken;
+bool pairingInProgress = false;
+bool pairSuccess = false;
+unsigned long pairStartTime = 0;
+#define PAIR_TIMEOUT_MS  30000
 
 // ==================== 函数声明 ====================
 
 bool connectWiFi();
 bool fetchTVStatus();
-bool togglePower();
+bool sendKey(const char *key);
+void startPairing();
+void saveToken(const String &token);
 void drawMain(bool busy = false);
 void drawStatus();
 void drawConnecting();
+void drawPairing(bool waiting);
 void drawBatteryIcon(int x, int y, int level, bool charging = false);
 void enterLightSleep();
 void wakeUp();
@@ -67,20 +89,19 @@ void wakeUp();
 
 void setup() {
   auto cfg = M5.config();
-  cfg.internal_imu = false;    // 不用 IMU，省电
-  cfg.internal_mic = false;     // 不用麦克风
-  cfg.internal_spk = false;     // 不用扬声器
-  cfg.output_power = false;     // 不用外部 5V
+  cfg.internal_imu = false;
+  cfg.internal_mic = false;
+  cfg.internal_spk = false;
+  cfg.output_power = false;
   M5.begin(cfg);
 
-  // CPU 降到 80MHz，省电；WiFi 和 TLS 在此频率仍可工作
   setCpuFrequencyMhz(80);
 
   Serial.begin(115200);
   delay(500);
-  Serial.println("Samsung TV Remote starting...");
+  Serial.println("Samsung TV Remote (Local WS) starting...");
 
-  M5.Display.setRotation(0);  // 竖屏 135x240
+  M5.Display.setRotation(0);
   M5.Display.setBrightness(DEFAULT_BRIGHTNESS);
   M5.Display.clear();
 
@@ -88,7 +109,7 @@ void setup() {
 
   if (!connectWiFi()) {
     M5.Display.fillScreen(TFT_WHITE);
-    M5.Display.setTextColor(0xC000, TFT_WHITE);  // 深红
+    M5.Display.setTextColor(0xC000, TFT_WHITE);
     M5.Display.setTextDatum(MC_DATUM);
     M5.Display.setFont(&fonts::FreeSansBold9pt7b);
     M5.Display.drawCenterString("WiFi Failed", M5.Display.width() / 2, 100);
@@ -98,9 +119,22 @@ void setup() {
     while (true) delay(1000);
   }
 
-  tvConfigured = (strlen(ST_TOKEN) > 0 && strlen(ST_DEVICE_ID) > 0);
-  fetchTVStatus();
-  drawMain();
+  // 加载已存 token
+  prefs.begin("samsung_tv", true);
+  wsToken = prefs.getString("ws_token", "");
+  prefs.end();
+
+  tvConfigured = (strlen(TV_HOST) > 0 && wsToken.length() > 0);
+
+  if (tvConfigured) {
+    fetchTVStatus();
+    drawMain();
+  } else if (strlen(TV_HOST) > 0) {
+    startPairing();
+  } else {
+    tvConfigured = false;
+    drawMain();
+  }
   lastActivity = millis();
   Serial.println("Ready.");
 }
@@ -110,17 +144,22 @@ void setup() {
 void loop() {
   M5.update();
 
-  // 检测任意按钮活动
+  // 配对超时检查
+  if (pairingInProgress && (millis() - pairStartTime > PAIR_TIMEOUT_MS)) {
+    Serial.println("Pairing timed out");
+    pairingInProgress = false;
+    drawPairing(false);
+  }
+
+  // 按钮活动检测
   bool anyButton = M5.BtnA.wasPressed() || M5.BtnA.wasSingleClicked() ||
                    M5.BtnA.wasDoubleClicked() || M5.BtnB.wasPressed() ||
                    M5.BtnB.wasSingleClicked() || M5.BtnB.wasDoubleClicked();
   if (anyButton) {
     lastActivity = millis();
-    // 如果背光不亮，先亮起来，不处理按钮动作
     if (currentBrightness != DEFAULT_BRIGHTNESS) {
       currentBrightness = DEFAULT_BRIGHTNESS;
       M5.Display.setBrightness(DEFAULT_BRIGHTNESS);
-      // 消费掉这次按钮事件，下一轮再处理实际动作
       return;
     }
     if (sleeping) {
@@ -129,8 +168,8 @@ void loop() {
     }
   }
 
-  // 背光三级省电：15s 减暗 → 60s 熄灭 → 120s light sleep
-  if (!actionBusy && !sleeping) {
+  // 背光三级省电
+  if (!actionBusy && !sleeping && !pairingInProgress) {
     unsigned long idle = millis() - lastActivity;
     if (idle > LIGHTSLEEP_TIMEOUT) {
       enterLightSleep();
@@ -139,19 +178,14 @@ void loop() {
       if (currentBrightness != 0) {
         M5.Display.setBrightness(0);
         currentBrightness = 0;
-        Serial.println("Backlight off");
       }
     } else if (idle > BACKLIGHT_DIM_TIMEOUT) {
       if (currentBrightness != DIM_BRIGHTNESS) {
         M5.Display.setBrightness(DIM_BRIGHTNESS);
         currentBrightness = DIM_BRIGHTNESS;
-        Serial.println("Backlight dim");
       }
     }
   }
-
-  // 不再自动轮询状态。只在按钮操作后刷新。
-  // 按钮操作后会 fetchTVStatus + 重绘一次。
 
   if (actionBusy) {
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -160,17 +194,18 @@ void loop() {
 
   if (currentScreen == SCREEN_MAIN) {
     if (M5.BtnA.wasSingleClicked()) {
-      // 确保背光亮着
       if (currentBrightness != DEFAULT_BRIGHTNESS) {
         currentBrightness = DEFAULT_BRIGHTNESS;
         M5.Display.setBrightness(DEFAULT_BRIGHTNESS);
       }
       actionBusy = true;
-      drawMain(true);  // 显示 busy
-      bool ok = togglePower();
+      drawMain(true);
+      bool ok = sendKey("KEY_POWER");
       if (ok) {
         tvOn = !tvOn;
         tvStatusValid = true;
+        delay(POWER_SETTLE_MS);
+        fetchTVStatus();
       }
       drawMain();
       actionBusy = false;
@@ -187,9 +222,187 @@ void loop() {
       drawMain();
     }
   }
+  else if (currentScreen == SCREEN_PAIRING) {
+    if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed()) {
+      currentScreen = SCREEN_MAIN;
+      fetchTVStatus();
+      drawMain();
+    }
+  }
 
-  // yield 让 CPU 进 idle，避免忙转发热
   vTaskDelay(pdMS_TO_TICKS(50));
+}
+
+// ==================== 配对 ====================
+
+void onPairMessage(websockets::WebsocketsMessage message) {
+  Serial.printf("[WS] %s\n", message.c_str());
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, message.c_str());
+  if (err) return;
+
+  const char *event = doc["event"];
+  if (!event) return;
+
+  if (strcmp(event, "ms.channel.connect") == 0) {
+    if (doc["data"].containsKey("token")) {
+      const char *token = doc["data"]["token"];
+      if (token && strlen(token) > 0) {
+        Serial.printf("Got token: %s\n", token);
+        saveToken(String(token));
+        wsToken = String(token);
+        pairSuccess = true;
+        pairingInProgress = false;
+        tvConfigured = true;
+        wsClient.close();
+        fetchTVStatus();
+        drawMain();
+      }
+    }
+  }
+}
+
+void startPairing() {
+  Serial.println("Starting pairing...");
+  currentScreen = SCREEN_PAIRING;
+  drawPairing(true);
+  pairingInProgress = true;
+  pairSuccess = false;
+  pairStartTime = millis();
+
+  // 配对连接不带 token
+  char wsPath[128];
+  snprintf(wsPath, sizeof(wsPath), "%s?name=%s", WS_PATH, APP_NAME_B64);
+
+  // 配置回调
+  wsClient.onMessage(onPairMessage);
+
+  if (!wsClient.connectSecure(TV_HOST, WS_PORT, wsPath)) {
+    Serial.println("WS connect failed for pairing");
+    drawPairing(false);
+    return;
+  }
+
+  Serial.println("WS connected, waiting for TV allow...");
+}
+
+// ==================== WS 控制 ====================
+
+bool sendKey(const char *key) {
+  if (!tvConfigured || wsToken.length() == 0) {
+    Serial.println("Not configured, starting pairing...");
+    startPairing();
+    return false;
+  }
+
+  // 每次发 key 建立新连接（Tizen 重置多 key 连接）
+  char wsPath[160];
+  snprintf(wsPath, sizeof(wsPath), "%s?name=%s&token=%s", WS_PATH, APP_NAME_B64, wsToken.c_str());
+
+  bool success = false;
+
+  // 临时回调只解析 connect 事件
+  auto handler = [&](websockets::WebsocketsMessage msg) {
+    JsonDocument doc;
+    if (deserializeJson(doc, msg.c_str())) return;
+    const char *event = doc["event"];
+    if (event && strcmp(event, "ms.channel.connect") == 0) {
+      // 连接已授权，发 key
+      JsonDocument cmd;
+      cmd["method"] = "ms.remote.control";
+      cmd["params"]["Cmd"] = "Click";
+      cmd["params"]["DataOfCmd"] = key;
+      cmd["params"]["Option"] = "false";
+      cmd["params"]["TypeOfRemote"] = "SendRemoteKey";
+
+      String out;
+      serializeJson(cmd, out);
+      wsClient.send(out);
+      success = true;
+      Serial.printf("Key sent: %s\n", key);
+    }
+  };
+
+  wsClient.onMessage(handler);
+
+  if (!wsClient.connectSecure(TV_HOST, WS_PORT, wsPath)) {
+    Serial.println("sendKey: WS connect failed");
+    return false;
+  }
+
+  // 轮询等待 connect 帧和 key 发送
+  unsigned long startMs = millis();
+  while (millis() - startMs < 10000 && !success) {
+    wsClient.poll();
+    delay(10);
+  }
+
+  // 断开连接
+  wsClient.close();
+  delay(200);
+
+  if (!success) {
+    Serial.println("sendKey failed (no connect frame)");
+  }
+  return success;
+}
+
+void saveToken(const String &token) {
+  prefs.begin("samsung_tv", false);
+  prefs.putString("ws_token", token);
+  prefs.end();
+}
+
+// ==================== REST 状态查询 ====================
+
+bool fetchTVStatus() {
+  if (strlen(TV_HOST) == 0) {
+    tvStatusValid = false;
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+
+  char url[128];
+  snprintf(url, sizeof(url), "https://%s:%d%s", TV_HOST, WS_PORT, REST_PATH);
+
+  if (!http.begin(client, url)) return false;
+
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    Serial.printf("Status fetch failed: %d\n", code);
+    tvStatusValid = false;
+    return false;
+  }
+
+  String resp = http.getString();
+  http.end();
+
+  int psIdx = resp.indexOf("\"PowerState\":\"");
+  if (psIdx >= 0) {
+    String ps = resp.substring(psIdx + 14, psIdx + 24);
+    ps = ps.substring(0, ps.indexOf("\""));
+    if (ps == "on") {
+      tvOn = true;
+      tvStatusValid = true;
+    } else if (ps == "standby") {
+      tvOn = false;
+      tvStatusValid = true;
+    } else if (ps.length() == 0) {
+      Serial.println("Transient PowerState");
+    } else {
+      tvStatusValid = false;
+    }
+  } else {
+    tvStatusValid = false;
+  }
+
+  Serial.printf("Status: on=%d valid=%d\n", tvOn, tvStatusValid);
+  return tvStatusValid;
 }
 
 // ==================== 省电 ====================
@@ -198,15 +411,12 @@ void enterLightSleep() {
   Serial.println("Entering light sleep...");
   sleeping = true;
 
-  // 配置 GPIO11 (BtnA) 和 GPIO12 (BtnB) 为低电平唤醒
   gpio_wakeup_enable(GPIO_NUM_11, gpio_int_type_t::GPIO_INTR_LOW_LEVEL);
   gpio_wakeup_enable(GPIO_NUM_12, gpio_int_type_t::GPIO_INTR_LOW_LEVEL);
   esp_sleep_enable_gpio_wakeup();
 
-  // 进入 light sleep，WiFi 保持关联但降功耗
   esp_light_sleep_start();
 
-  // 唤醒后
   Serial.println("Woke up from light sleep");
   sleeping = false;
   lastActivity = millis();
@@ -219,7 +429,6 @@ void wakeUp() {
   M5.Display.setBrightness(DEFAULT_BRIGHTNESS);
   lastActivity = millis();
 
-  // 确认 WiFi 还连着
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi disconnected, reconnecting...");
     WiFi.reconnect();
@@ -229,7 +438,6 @@ void wakeUp() {
     }
   }
 
-  // 刷新状态
   fetchTVStatus();
   if (currentScreen == SCREEN_MAIN) drawMain();
   else drawStatus();
@@ -241,8 +449,8 @@ bool connectWiFi() {
   Serial.printf("Connecting to %s\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(true);
-  WiFi.setTxPower(WIFI_POWER_13dBm);  // 室内 13dBm 够用
-  esp_wifi_set_ps(WIFI_PS_MAX_MODEM);  // 最激进 modem sleep
+  WiFi.setTxPower(WIFI_POWER_13dBm);
+  esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
   unsigned long start = millis();
@@ -258,104 +466,29 @@ bool connectWiFi() {
   return true;
 }
 
-// ==================== SmartThings API ====================
-
-bool sendCommand(const char *capability, const char *command) {
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-
-  char url[256];
-  snprintf(url, sizeof(url), "https://api.smartthings.com/v1/devices/%s/commands", ST_DEVICE_ID);
-
-  if (!http.begin(client, url)) return false;
-  http.addHeader("Authorization", "Bearer " ST_TOKEN);
-  http.addHeader("Content-Type", "application/json");
-
-  char body[256];
-  snprintf(body, sizeof(body),
-    "{\"commands\":[{\"component\":\"main\",\"capability\":\"%s\",\"command\":\"%s\"}]}",
-    capability, command);
-
-  int code = http.POST(body);
-  http.end();
-  Serial.printf("CMD %s/%s -> %d\n", capability, command, code);
-  return (code >= 200 && code < 300);  // 接受 2xx
-}
-
-bool fetchTVStatus() {
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-
-  char url[256];
-  snprintf(url, sizeof(url), "https://api.smartthings.com/v1/devices/%s/components/main/status", ST_DEVICE_ID);
-
-  if (!http.begin(client, url)) return false;
-  http.addHeader("Authorization", "Bearer " ST_TOKEN);
-
-  int code = http.GET();
-  if (code != 200) {
-    http.end();
-    Serial.printf("Status fetch failed: %d\n", code);
-    lastStatusFetch = millis();
-    return false;
-  }
-
-  String resp = http.getString();
-  http.end();
-
-  // 简单字符串解析
-  tvOn = resp.indexOf("\"switch\":{\"switch\":{\"value\":\"on\"") >= 0 ||
-         (resp.indexOf("\"value\":\"on\"") >= 0 && resp.indexOf("switch") >= 0);
-  tvStatusValid = true;
-
-  int volIdx = resp.indexOf("\"audioVolume\":{\"volume\":{\"value\":\"");
-  if (volIdx >= 0) {
-    tvVolume = resp.substring(volIdx + 34, volIdx + 40).toInt();
-  }
-
-  tvMuted = resp.indexOf("\"mute\":{\"value\":\"mute\"") >= 0;
-
-  lastStatusFetch = millis();
-  Serial.printf("Status: on=%d vol=%d muted=%d\n", tvOn, tvVolume, tvMuted);
-  return true;
-}
-
-bool togglePower() {
-  if (tvOn) return sendCommand("switch", "off");
-  return sendCommand("switch", "on");
-}
-
 // ==================== UI ====================
 
 void drawBatteryIcon(int x, int y, int level, bool charging) {
-  // 电池图标：电极在左侧（正极朝左），电量条从右往左长
-  // level: 0-100, charging: 充电时变黄
   int w = 22, h = 12;
   uint16_t color;
   if (charging) {
-    color = 0xFE40;  // 黄色
+    color = 0xFE40;
   } else if (level < 20) {
     color = TFT_RED;
   } else {
     color = TFT_BLACK;
   }
 
-  // 电极（左侧小凸起）
   M5.Display.fillRect(x, y + 3, 3, 6, color);
-  // 外壳
   int bodyX = x + 3;
   M5.Display.drawRect(bodyX, y, w, h, color);
 
-  // 电量条：从外壳内部右端开始，向左填充
   int innerW = w - 4;
   int barW = innerW * level / 100;
   if (barW > 0) {
     M5.Display.fillRect(bodyX + 2 + (innerW - barW), y + 2, barW, h - 4, color);
   }
 
-  // 百分比文字
   M5.Display.setFont(&fonts::Font0);
   M5.Display.setTextSize(1);
   M5.Display.setTextDatum(TL_DATUM);
@@ -376,17 +509,38 @@ void drawConnecting() {
   M5.Display.drawCenterString("to WiFi...", M5.Display.width() / 2, 122);
   M5.Display.setFont(&fonts::Font0);
   M5.Display.setTextColor(COLOR_DIM, TFT_WHITE);
-  // 截断长 SSID
   String ssid = WIFI_SSID;
   if (ssid.length() > 20) ssid = ssid.substring(0, 19) + "...";
   M5.Display.drawCenterString(ssid, M5.Display.width() / 2, 155);
+}
+
+void drawPairing(bool waiting) {
+  M5.Display.clear();
+  M5.Display.fillScreen(TFT_WHITE);
+  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+  M5.Display.setTextDatum(MC_DATUM);
+  M5.Display.setFont(&fonts::FreeSansBold9pt7b);
+  M5.Display.setTextSize(1);
+  M5.Display.drawCenterString("Pairing", M5.Display.width() / 2, 28);
+
+  M5.Display.setFont(&fonts::FreeSans9pt7b);
+  if (waiting) {
+    M5.Display.drawCenterString("Press ALLOW", M5.Display.width() / 2, 80);
+    M5.Display.drawCenterString("on TV screen", M5.Display.width() / 2, 110);
+  } else {
+    M5.Display.setTextColor(0xC000, TFT_WHITE);
+    M5.Display.drawCenterString("Timeout!", M5.Display.width() / 2, 90);
+  }
+
+  M5.Display.setFont(&fonts::Font0);
+  M5.Display.setTextColor(COLOR_DIM, TFT_WHITE);
+  M5.Display.drawCenterString("A/B to continue", M5.Display.width() / 2, 180);
 }
 
 void drawMain(bool busy) {
   M5.Display.clear();
   M5.Display.fillScreen(TFT_WHITE);
 
-  // 电池图标右上角，充电时变黄
   int battLevel = M5.Power.getBatteryLevel();
   if (battLevel < 0) battLevel = 0;
   if (battLevel > 100) battLevel = 100;
@@ -395,7 +549,6 @@ void drawMain(bool busy) {
 
   M5.Display.setTextDatum(MC_DATUM);
 
-  // 大字 ON/OFF/-- 用原生大字体
   M5.Display.setFont(&fonts::FreeSansBold24pt7b);
   M5.Display.setTextSize(1);
   if (busy) {
@@ -412,15 +565,12 @@ void drawMain(bool busy) {
     M5.Display.drawCenterString("OFF", M5.Display.width() / 2, 70);
   }
 
-  // 副标题
   M5.Display.setFont(&fonts::FreeSans9pt7b);
   M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
   M5.Display.drawCenterString("Samsung TV", M5.Display.width() / 2, 135);
 
-  // 分割线
   M5.Display.drawLine(20, 190, M5.Display.width() - 20, 190, COLOR_DIM);
 
-  // 底部提示
   M5.Display.setFont(&fonts::Font0);
   M5.Display.setTextColor(COLOR_DIM, TFT_WHITE);
   M5.Display.drawCenterString("A  POWER   B  INFO", M5.Display.width() / 2, 205);
@@ -431,14 +581,12 @@ void drawStatus() {
   M5.Display.fillScreen(TFT_WHITE);
   M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
 
-  // 标题
   M5.Display.setTextDatum(TL_DATUM);
   M5.Display.setFont(&fonts::FreeSansBold9pt7b);
   M5.Display.setTextSize(1);
   M5.Display.drawString("TV Status", 8, 12);
   M5.Display.drawLine(8, 38, M5.Display.width() - 8, 38, COLOR_DIM);
 
-  // 主状态行
   M5.Display.setFont(&fonts::FreeSans9pt7b);
   M5.Display.drawString("Power", 8, 52);
   if (tvOn) {
@@ -449,21 +597,23 @@ void drawStatus() {
   M5.Display.setTextDatum(TR_DATUM);
   M5.Display.drawString(tvStatusValid ? (tvOn ? "ON" : "OFF") : "--", M5.Display.width() - 8, 52);
 
+  // Volume 和 Muted 本地协议不可读
   M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
   M5.Display.setTextDatum(TL_DATUM);
   M5.Display.drawString("Volume", 8, 81);
   M5.Display.setTextDatum(TR_DATUM);
-  M5.Display.drawString(String(tvVolume), M5.Display.width() - 8, 81);
+  M5.Display.setTextColor(COLOR_DIM, TFT_WHITE);
+  M5.Display.drawString("N/A", M5.Display.width() - 8, 81);
 
+  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
   M5.Display.setTextDatum(TL_DATUM);
   M5.Display.drawString("Muted", 8, 110);
   M5.Display.setTextDatum(TR_DATUM);
-  M5.Display.drawString(tvMuted ? "Yes" : "No", M5.Display.width() - 8, 110);
+  M5.Display.setTextColor(COLOR_DIM, TFT_WHITE);
+  M5.Display.drawString("N/A", M5.Display.width() - 8, 110);
 
-  // 网络分割线
   M5.Display.drawLine(8, 141, M5.Display.width() - 8, 141, COLOR_DIM);
 
-  // 网络信息
   M5.Display.setTextDatum(TL_DATUM);
   M5.Display.setFont(&fonts::Font0);
   M5.Display.setTextColor(COLOR_DIM, TFT_WHITE);
@@ -475,7 +625,12 @@ void drawStatus() {
   M5.Display.drawString("SSID:", 8, 185);
   M5.Display.drawString(ssid, 8, 198);
 
-  // 底部提示
+  // 配对状态
+  M5.Display.drawString("Paired:", 8, 215);
+  M5.Display.setTextColor(tvConfigured ? TFT_DARKGREEN : TFT_RED, TFT_WHITE);
+  M5.Display.drawString(tvConfigured ? "Yes" : "No", 70, 215);
+
+  M5.Display.setTextColor(COLOR_DIM, TFT_WHITE);
   M5.Display.setTextDatum(MC_DATUM);
-  M5.Display.drawCenterString("A / B  BACK", M5.Display.width() / 2, 222);
+  M5.Display.drawCenterString("A / B  BACK", M5.Display.width() / 2, 232);
 }
